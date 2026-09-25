@@ -52,6 +52,12 @@ only while it runs — the daemon is what makes the tint persist. `set`/`on`/
 `off` still work while the daemon runs: they update the config file and the
 daemon re-applies within ~3s.
 
+**Self-healing:** on re-docking, WindowServer can wipe gamma tables *after*
+the last reconfiguration callback fires, leaving the tint off with no event
+to wake the daemon. The daemon therefore reads each display's live table
+every second and reapplies whenever it drifts from the configured gains —
+hotplug, sleep, or anything else that resets gamma is corrected within ~1s.
+
 ## Notes for a stable two-display match
 
 - Keep Night Shift off — it fights the tint (the daemon re-applies over it,

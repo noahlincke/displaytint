@@ -117,24 +117,30 @@ func kelvinGains(_ kelvin: Double) -> (r: Double, g: Double, b: Double) {
 // Temperature gains go on in the encoded domain directly (they are sRGB
 // colors); brightness is a linear-light factor, so it is encoded first.
 
-func apply(_ d: Display, cfg: Config) -> String {
+// Encoded-channel maxima a display should be showing under cfg.
+func expectedTop(_ d: Display, cfg: Config) -> (Float, Float, Float) {
     let ov = cfg.override(for: d.name, builtin: d.builtin)
     let kelvin = ov?.temperature ?? cfg.kelvin
     let bright = min(max(ov?.brightness ?? cfg.globalBrightness, 0.01), 1.0)
     let g = kelvinGains(kelvin)
     let dim = pow(bright, 1.0 / 2.2)
-    let rMax = min(g.r * dim, 1)
-    let gMax = min(g.g * dim, 1)
-    let bMax = min(g.b * dim, 1)
+    return (Float(min(g.r * dim, 1)), Float(min(g.g * dim, 1)), Float(min(g.b * dim, 1)))
+}
+
+func apply(_ d: Display, cfg: Config) -> String {
+    let ov = cfg.override(for: d.name, builtin: d.builtin)
+    let kelvin = ov?.temperature ?? cfg.kelvin
+    let bright = min(max(ov?.brightness ?? cfg.globalBrightness, 0.01), 1.0)
+    let t = expectedTop(d, cfg: cfg)
     let err = CGSetDisplayTransferByFormula(d.id,
-                                            0, Float(rMax), 1,
-                                            0, Float(gMax), 1,
-                                            0, Float(bMax), 1)
+                                            0, t.0, 1,
+                                            0, t.1, 1,
+                                            0, t.2, 1)
     if err != .success {
         return "\(d.name): error \(err.rawValue)"
     }
     return String(format: "%@ → %.0fK × %.2f  (r %.3f  g %.3f  b %.3f)",
-                  d.name, kelvin, bright, rMax, gMax, bMax)
+                  d.name, kelvin, bright, t.0, t.1, t.2)
 }
 
 func neutralize(_ d: Display) {
@@ -171,8 +177,8 @@ final class DirtyFlag {
 }
 
 var dirty = DirtyFlag()
-var lastSig = ""
 var lastMtime: Date?
+var cachedCfg: Config?
 
 let pidURL = Config.url.deletingLastPathComponent().appendingPathComponent("daemon.pid")
 
@@ -186,22 +192,29 @@ func daemonPid() -> pid_t? {
 // through this flag back to the run loop.
 func daemonTick() {
     let m = mtime(Config.url.path)
-    if !dirty.take() && m == lastMtime { return }
-    lastMtime = m
-    let cfg = Config.load()
-    var lines: [String] = []
+    if m != lastMtime {
+        lastMtime = m
+        cachedCfg = Config.load()
+        dirty.set()
+    }
+    guard let cfg = cachedCfg else { return }
+    let forced = dirty.take()
     for d in currentDisplays() {
         if cfg.on {
-            lines.append(apply(d, cfg: cfg))
-        } else {
+            // Self-healing: macOS wipes gamma tables out from under us on
+            // plug/unplug — sometimes after the last reconfiguration
+            // callback — so verify each second and reapply on drift.
+            let want = expectedTop(d, cfg: cfg)
+            let drifted = readback(d.id).map {
+                abs($0.0 - want.0) > 0.002 || abs($0.1 - want.1) > 0.002 || abs($0.2 - want.2) > 0.002
+            } ?? true
+            if forced || drifted {
+                log(apply(d, cfg: cfg))
+            }
+        } else if forced {
             neutralize(d)
-            lines.append("\(d.name) → neutral")
+            log("\(d.name) → neutral")
         }
-    }
-    let sig = lines.joined(separator: "\n")
-    if sig != lastSig {
-        log(sig)
-        lastSig = sig
     }
 }
 
